@@ -14,6 +14,8 @@ TWITTER_TARGET_ACCOUNTS=target_account_1
 
 Then run `pnpm install` to install the dependencies.
 
+Start PostgreSQL database: `docker-compose -f docker-compose-db.yml up`
+
 To start the agent, run `pnpm start`.
 
 # Eliza

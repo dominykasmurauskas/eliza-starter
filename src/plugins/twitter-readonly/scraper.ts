@@ -1,6 +1,6 @@
 import { IAgentRuntime, elizaLogger, stringToUuid } from "@elizaos/core";
 import { ClientBase } from "./base.ts";
-import { CleanProfile, CleanTweet, ScraperState } from "./types.ts";
+import { ScraperState } from "./types.ts";
 
 export class TwitterScraper {
     private client: ClientBase;
@@ -24,22 +24,37 @@ export class TwitterScraper {
             return;
         }
 
-        this.isRunning = true;
-        elizaLogger.warn("Twitter scraper started");
+        try {
+            this.isRunning = true;
+            elizaLogger.info("Twitter scraper starting...");
 
-        // Load persisted state first
-        await this.loadState();
-        // Then initialize any missing tweets from knowledge base
-        await this.initializeLastScrapedTweets();
+            // Initialize the client first
+            await this.client.init();
+            elizaLogger.info("Twitter client initialized");
 
-        await this.scrapeData();
+            // Load persisted state
+            await this.loadState();
+            await this.initializeLastScrapedTweets();
 
-        // Set up periodic scraping
-        setInterval(() => {
-            this.scrapeData().catch(error => {
-                elizaLogger.error("Error during periodic scrape:", error);
-            });
-        }, this.scrapeInterval);
+            // Start periodic scraping in the background
+            setTimeout(() => {
+                this.scrapeData().catch(error => {
+                    elizaLogger.error("Error during initial scrape:", error);
+                });
+            }, 0);
+
+            setInterval(() => {
+                this.scrapeData().catch(error => {
+                    elizaLogger.error("Error during periodic scrape:", error);
+                });
+            }, this.scrapeInterval);
+
+            elizaLogger.info("Twitter scraper started successfully");
+        } catch (error) {
+            this.isRunning = false;
+            elizaLogger.error("Failed to start Twitter scraper:", error);
+            throw error;
+        }
     }
 
     private async loadState() {
@@ -89,7 +104,7 @@ export class TwitterScraper {
                 });
 
                 if (existingTweets.length > 0) {
-                    const tweets = JSON.parse(existingTweets[0].content.text) as CleanTweet[];
+                    const tweets = JSON.parse(existingTweets[0].content.text) as any[];
                     if (tweets.length > 0) {
                         // Store the most recent tweet ID
                         this.lastScrapedTweets.set(username, tweets[0].id);
@@ -102,88 +117,130 @@ export class TwitterScraper {
         }
     }
 
-    private cleanProfile(profile: any): CleanProfile {
-        return {
-            id: profile.id || profile.rest_id,
-            username: profile.screenName || profile.screen_name,
-            name: profile.name,
-            description: profile.description,
-            followersCount: profile.followersCount || profile.followers_count,
-            followingCount: profile.friendsCount || profile.friends_count,
-            tweetsCount: profile.statusesCount || profile.statuses_count,
-            verified: profile.verified,
-        };
+    private formatProfileForRAG(profile: any): string {
+        const sections = [
+            `Twitter Profile: @${profile.username}`,
+            `Name: ${profile.name}`,
+            `Bio: ${profile.biography}`,
+            
+            // Engagement metrics
+            `Metrics:`,
+            `- Followers: ${profile.followersCount.toLocaleString()}`,
+            `- Following: ${profile.friendsCount.toLocaleString()}`,
+            `- Total Tweets: ${profile.tweetsCount.toLocaleString()}`,
+            `- Media Posts: ${profile.mediaCount.toLocaleString()}`,
+            `- Likes Given: ${profile.likesCount.toLocaleString()}`,
+            `- Listed In: ${profile.listedCount.toLocaleString()}`,
+            
+            // Account details
+            `Account Details:`,
+            `- Joined: ${profile.joined}`,
+            `- Location: ${profile.location || 'Not specified'}`,
+            `- Website: ${profile.website || 'Not specified'}`,
+            
+            // Verification status
+            `Status:`,
+            `- Verified: ${profile.isVerified ? 'Yes' : 'No'}`,
+            `- Twitter Blue: ${profile.isBlueVerified ? 'Yes' : 'No'}`,
+            `- Private Account: ${profile.isPrivate ? 'Yes' : 'No'}`,
+            
+            // Media links
+            `Media:`,
+            `- Avatar: ${profile.avatar}`,
+            profile.banner ? `- Banner: ${profile.banner}` : null,
+            
+            // Pinned content
+            profile.pinnedTweetIds?.length ? `Pinned Tweets: ${profile.pinnedTweetIds.join(', ')}` : null,
+        ];
+
+        return sections.filter(Boolean).join('\n');
     }
 
-    private cleanTweet(tweet: any): CleanTweet {
-        const legacy = tweet.legacy || tweet;
-        return {
-            id: tweet.id || tweet.rest_id,
-            text: legacy.full_text || tweet.text || legacy.text,
-            createdAt: tweet.createdAt || legacy.created_at,
-            authorId: tweet.authorId || legacy.user_id_str,
-            authorName: tweet.authorName || legacy.user?.name,
-            authorUsername: tweet.authorUsername || legacy.user?.screen_name,
-            metrics: {
-                likes: legacy.favorite_count || legacy.favourites_count,
-                retweets: legacy.retweet_count,
-                replies: legacy.reply_count,
-                views: legacy.view_count,
-            },
-        };
+    private formatTweetForRAG(tweet: any): string {
+        const timestamp = tweet.timeParsed || new Date(tweet.timestamp * 1000).toISOString();
+        let content = '';
+
+        if (tweet.isRetweet && tweet.retweetedStatus) {
+            content = `Retweet by @${tweet.username} (${timestamp})
+Original tweet by @${tweet.retweetedStatus.username}:
+${tweet.retweetedStatus.text}
+
+Original Engagement: ${tweet.retweetedStatus.likes} likes, ${tweet.retweetedStatus.retweets} retweets, ${tweet.retweetedStatus.replies} replies`;
+        } else {
+            content = `Tweet by @${tweet.username} (${timestamp})
+${tweet.text}
+
+Engagement: ${tweet.likes} likes, ${tweet.retweets} retweets, ${tweet.replies} replies`;
+        }
+
+        if (tweet.photos?.length > 0) {
+            content += `\nPhotos: ${tweet.photos.join(', ')}`;
+        }
+
+        if (tweet.videos?.length > 0) {
+            content += `\nVideos: ${tweet.videos.join(', ')}`;
+        }
+
+        if (tweet.urls?.length > 0) {
+            content += `\nLinks: ${tweet.urls.join(', ')}`;
+        }
+
+        if (tweet.hashtags?.length > 0) {
+            content += `\nHashtags: ${tweet.hashtags.join(' ')}`;
+        }
+
+        return content;
     }
 
     private async scrapeData() {
         for (const username of this.targetAccounts) {
             try {
-                // Get user profile (always update as it changes frequently)
-                const profile = await this.client.getUserProfile(username);
-                const cleanedProfile = this.cleanProfile(profile);
-                await this.storeKnowledge(`${username}-profile`, JSON.stringify(cleanedProfile, null, 2));
+                elizaLogger.info(`Starting to scrape data for ${username}`);
 
+                // Get user profile
+                const profile = await this.client.getUserProfile(username);
+                if (!profile) {
+                    throw new Error(`Failed to fetch profile for ${username}`);
+                }
+
+                elizaLogger.info(`Fetched profile for ${username}`, { profile });
+                const formattedProfile = this.formatProfileForRAG(profile);
+                await this.storeKnowledge(`${username}-profile`, formattedProfile);
                 elizaLogger.info(`Scraped profile for ${username}`);
 
                 // Get user tweets
                 const tweets = await this.client.getUserTweets(username);
-                const lastScrapedId = this.lastScrapedTweets.get(username);
+                if (!tweets || tweets.length === 0) {
+                    elizaLogger.info(`No tweets found for ${username}`);
+                    continue;
+                }
 
-                // Filter only new tweets
+                const lastScrapedId = this.lastScrapedTweets.get(username);
                 const newTweets = lastScrapedId
                     ? tweets.filter(tweet => tweet.id > lastScrapedId)
                     : tweets;
 
-                if (newTweets.length === 0) {
-                    elizaLogger.info(`No new tweets for ${username}`);
-                    continue;
-                }
-
-                // Process each tweet individually
                 for (const tweet of newTweets) {
-                    elizaLogger.info(`Scraping tweet`, tweet);
-                    const cleanedTweet = this.cleanTweet(tweet);
+                    try {
+                        if (!tweet || !tweet.id) continue;
 
-                    // Get replies for this tweet
-                    const replies = await this.client.getTweetReplies(tweet.id);
-                    if (replies.length > 0) {
-                        cleanedTweet.replies = replies.map(reply => this.cleanTweet(reply));
+                        elizaLogger.info(`Formatting tweet ${tweet.id}`, tweet);
+                        const formattedContent = this.formatTweetForRAG(tweet);
+                        await this.storeKnowledge(`tweet-${tweet.id}`, formattedContent);
+                        elizaLogger.info(`Stored tweet ${tweet.id}`);
+                    } catch (tweetError) {
+                        elizaLogger.error(`Failed to process tweet ${tweet?.id}:`, {
+                            error: tweetError,
+                            tweet: JSON.stringify(tweet, null, 2)
+                        });
                     }
-
-                    // Store each tweet as a separate document
-                    await this.storeKnowledge(
-                        `tweet-${tweet.id}`,
-                        JSON.stringify(cleanedTweet, null, 2)
-                    );
-                    elizaLogger.info(`Stored tweet ${tweet.id} with ${cleanedTweet.replies?.length || 0} replies`);
                 }
 
-                // Update last scraped ID
                 if (newTweets.length > 0) {
                     this.lastScrapedTweets.set(username, newTweets[0].id);
                     await this.saveState();
-                    elizaLogger.info(`Updated last tweet ID for ${username}: ${newTweets[0].id}`);
                 }
 
-                elizaLogger.info(`Successfully scraped data for ${username}`);
             } catch (error) {
                 elizaLogger.error(`Failed to scrape data for ${username}:`, error);
             }
@@ -192,6 +249,24 @@ export class TwitterScraper {
 
     private async storeKnowledge(id: string, content: string) {
         try {
+            // Check if knowledge with this ID already exists
+            const existing = await this.runtime.ragKnowledgeManager.getKnowledge({
+                id: stringToUuid(id),
+            });
+
+            // If content is the same, skip storing
+            if (existing.length > 0 && existing[0].content.text === content) {
+                elizaLogger.info(`Knowledge ${id} unchanged, skipping update`);
+                return;
+            }
+
+            // If there's existing knowledge, delete it first
+            if (existing.length > 0) {
+                await this.runtime.ragKnowledgeManager.removeKnowledge(stringToUuid(id));
+                elizaLogger.info(`Deleted old knowledge ${id}`);
+            }
+
+            // Store new knowledge
             await this.runtime.ragKnowledgeManager.createKnowledge({
                 id: stringToUuid(id),
                 agentId: this.runtime.agentId,
@@ -199,12 +274,13 @@ export class TwitterScraper {
                     text: content,
                     metadata: {
                         source: "twitter-readonly",
-                        type: "json",
+                        type: "text",
                         createdAt: Date.now(),
                         isShared: true
                     },
                 },
             });
+            elizaLogger.info(`Stored new knowledge ${id}`);
         } catch (error) {
             elizaLogger.error(`Failed to store knowledge for ${id}:`, error);
             throw error;

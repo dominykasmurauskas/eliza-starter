@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    environment:
+      POSTGRES_DB: eliza
+      POSTGRES_USER: eliza
+      POSTGRES_PASSWORD: eliza123
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./docker/postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eliza"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
